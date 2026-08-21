@@ -282,6 +282,7 @@ fun ListsApp() {
         )
     }
     var syncTick by remember { mutableStateOf(0) }
+    var connectTick by remember { mutableStateOf(0) }
 
     /** Durable-first mutation: commit to the outbox, show it, then sync. */
     fun mutate(op: JSONObject) {
@@ -414,7 +415,11 @@ fun ListsApp() {
                 val ttl = tokenExp(newToken)
                     ?.let { maxOf(1L, it - System.currentTimeMillis() / 1000) } ?: 0L
                 Store.setConfig(ctx, newServer, newToken, ttl)
-                syncTick += 0 // connect below handles its own sync
+                // The native client still holds the previous credentials;
+                // only connect() feeds it these. Force the reconfigure even
+                // when a stale connection looks healthy.
+                connected = false
+                connectTick += 1
                 screen = Screen.Main
             },
             onBack = { screen = Screen.Main },
@@ -422,8 +427,9 @@ fun ListsApp() {
         }
     }
 
-    // Reconnect when settings hand back a (possibly new) server/token.
-    LaunchedEffect(server, token) {
-        if (server.isNotBlank() && token.isNotBlank() && !connected && !connecting) connect()
+    // Reconfigure whenever settings hand back credentials — Connect is a
+    // command, not a condition.
+    LaunchedEffect(connectTick) {
+        if (connectTick > 0 && server.isNotBlank() && token.isNotBlank() && !connecting) connect()
     }
 }
