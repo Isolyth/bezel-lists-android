@@ -1,4 +1,4 @@
-package com.example.bezellists
+package dev.bezel.client
 
 import org.json.JSONObject
 

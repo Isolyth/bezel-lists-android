@@ -3,6 +3,7 @@ package com.example.bezellists
 import android.annotation.SuppressLint
 import android.content.Context
 import android.util.Base64
+import dev.bezel.client.Bezel
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
