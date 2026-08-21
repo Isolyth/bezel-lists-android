@@ -2,6 +2,7 @@ package com.example.bezellists
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.util.Base64
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
@@ -23,6 +24,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 const val FACET = "lists/v1"
 const val CLIENT = "Lists (Android) v0.3"
@@ -37,9 +39,20 @@ private object Store {
     private fun prefs(ctx: Context) = ctx.getSharedPreferences("bezel", Context.MODE_PRIVATE)
 
     fun getConfig(ctx: Context, key: String): String = prefs(ctx).getString(key, "") ?: ""
-    fun setConfig(ctx: Context, server: String, token: String) {
-        prefs(ctx).edit().putString("server", server).putString("token", token).apply()
+
+    /** `ttl` is the token lifetime observed at connect (exp − now), the
+     * lifetime every refresh preserves; 0 means the token never expires. */
+    fun setConfig(ctx: Context, server: String, token: String, ttl: Long) {
+        prefs(ctx).edit()
+            .putString("server", server).putString("token", token).putLong("ttl", ttl)
+            .apply()
     }
+
+    fun setToken(ctx: Context, token: String) {
+        prefs(ctx).edit().putString("token", token).apply()
+    }
+
+    fun getTtl(ctx: Context): Long = prefs(ctx).getLong("ttl", 0L)
 
     /** The device's iroh identity: 32 random bytes, minted once, kept
      * forever — so source.addr names this phone stably. */
@@ -75,6 +88,50 @@ private object Store {
     private fun parseArray(s: String?): List<JSONObject> {
         val arr = JSONArray(s ?: "[]")
         return (0 until arr.length()).map { arr.getJSONObject(it) }
+    }
+}
+
+// ---------------------------------------------------------------- capability
+// Tokens carry their own expiry; the app refreshes at half-life via
+// POST /v1/capabilities/refresh, always requesting the lifetime the
+// admin chose at mint time — refresh moves time, not privilege.
+
+/** The token's exp claim (unix seconds), or null when it never expires
+ * (or the string isn't a bezel token — treated the same: never refresh). */
+fun tokenExp(token: String): Long? = try {
+    val payload = token.split(".").getOrNull(1)
+    val json = JSONObject(String(Base64.decode(payload, Base64.URL_SAFE)))
+    if (json.isNull("exp")) null else json.getLong("exp")
+} catch (_: Exception) {
+    null
+}
+
+private val refreshInFlight = AtomicBoolean(false)
+
+private class Refresh(val token: String?, val expired: Boolean)
+
+/** Refresh when less than half the recorded ttl remains. Returns the
+ * fresh token to persist and surface, or flags the token as dead; both
+ * null/false when there is nothing to do. Transport failures stay
+ * silent — the next sync re-evaluates from scratch. */
+private fun maybeRefresh(ctx: Context, current: String): Refresh {
+    val none = Refresh(null, false)
+    val ttl = Store.getTtl(ctx)
+    if (ttl <= 0) return none
+    val exp = tokenExp(current) ?: return none
+    if (exp - System.currentTimeMillis() / 1000 >= ttl / 2) return none
+    if (!refreshInFlight.compareAndSet(false, true)) return none
+    try {
+        val r = Bezel.refreshCapability(ttl)
+        return if (r.optBoolean("ok")) {
+            val fresh = r.getString("token")
+            Store.setToken(ctx, fresh)
+            Refresh(fresh, false)
+        } else {
+            Refresh(null, r.optString("error").contains("401"))
+        }
+    } finally {
+        refreshInFlight.set(false)
     }
 }
 
@@ -233,6 +290,13 @@ fun ListsApp() {
     }
 
     suspend fun sync() = withContext(Dispatchers.IO) {
+        val refreshed = maybeRefresh(ctx, token)
+        if (refreshed.token != null || refreshed.expired) {
+            withContext(Dispatchers.Main) {
+                refreshed.token?.let { token = it }
+                if (refreshed.expired) status = "token expired · paste a new one"
+            }
+        }
         val drop = drainOutbox(ctx)
         val (fetched, err) = fetchItems()
         withContext(Dispatchers.Main) {
@@ -345,7 +409,10 @@ fun ListsApp() {
             connecting = connecting,
             onConnect = { newServer, newToken ->
                 server = newServer; token = newToken
-                Store.setConfig(ctx, newServer, newToken)
+                // The lifetime the admin chose, captured while it's observable.
+                val ttl = tokenExp(newToken)
+                    ?.let { maxOf(1L, it - System.currentTimeMillis() / 1000) } ?: 0L
+                Store.setConfig(ctx, newServer, newToken, ttl)
                 syncTick += 0 // connect below handles its own sync
                 screen = Screen.Main
             },
